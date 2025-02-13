@@ -19,10 +19,9 @@ import sys
 import heapq
 import random 
 import json
+import argparse
+from logEntry import logEntry
 #latest term server has seen
-
-
-
 currentTerm = 0
 #currentLeader
 currentLeader = None
@@ -38,152 +37,138 @@ log = []
 commitIndex = 0
 #index of highest log entry applied to data store
 lastApplied = 0
-
 #for each server, index of the next log entry to send to that server
 nextIndex = None 
 #for each server, index of highest log entry known to be replicated on server
 matchIndex = None
-
-
 #used for electionTimeout
 electionTimeout = 0 #static
 timer = None
-sendDelay = .5
+sendDelay = 3
 
-
-#majority table
-reqVotes = {}
-
-balance = None #datastore
-
+#memory balance
+balance = {}
 #mapping for ports to id but we just use 900012 hard mapped for now
 users = {}
+entryKeys = {}
 
-ids = set()
+#locks are updated when a transaction starts
+#if leader sees that a variable has a lock >0, it rejects
+#if not...
+#when a process gets a lock it tells everyone
+#when a process releases a lock it tells everyone
+#save the locks so on startup, we can tell everyone i released the lock
+mylocks = set()
+locks = {}
 
 
-
-def getBalance():
-    return None, [0]
-    
-
-class logEntry():
-    #type of entry
-    t = None
-    #index of entry
-    index = None
-    #term of the logentry
-    term = None
-    #transactions are in the form (sender, receiver, amount)
-    transaction = None
-
-    def __init__(self, index, term, trans=None, t=None):
-        self.t = t
-        self.index = index
-        self.term = term
-        self.transaction = trans  # Transaction is a tuple (sender, receiver, amount)
-
-    def to_dict(self):
-        """Convert the logEntry object to a dictionary."""
-        return {
-            "t": self.t,
-            "index": self.index,
-            "term": self.term,
-            "transaction": self.transaction
-        }
-
-    @staticmethod
-    def from_dict(data):
-        """Create a logEntry object from a dictionary."""
-        return logEntry(
-            index=data["index"],
-            term=data["term"],
-            trans=data["transaction"],
-            t=data.get("t")
-        )
-
-    def __str__(self):
-        return (
-            "(\n"
-            + f"\tIndex: {self.index}\n"
-            + f"\tTerm: {self.term}\n"
-            + f"\tSender: {self.transaction[0]}\n"
-            + f"\tReceiver: {self.transaction[1]}\n"
-            + f"\tAmount: {self.transaction[2]}\n"
-            + ")\n"
-        )
-        
+DEBUG = False  # or False to turn off debug output
+databaseUpdate = 0
 
 #conducts a transaction and adds it to the blockchain also updates the balances
-def conductTransaction(sender, receiver, amount):
-    global blockchain, balance, metime, users, requests, replies
-    if len(blockchain) == 0:
-        block = Block((None, None), (str(sender), str(receiver), str(amount)))
-    else:
-        lastBlock = blockchain[len(blockchain)-1]
-        lastBlockHash = str(lastBlock.hash[1])
-        lastBlockTransaction = lastBlock.getTransaction()
-        block = Block((len(blockchain), sha256((lastBlockHash+lastBlockTransaction).encode('utf-8')).hexdigest()), (str(sender), str(receiver), str(amount)))
-    blockchain.append(block)
+def commitTransaction(sender, receiver, amount):
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
     balance[sender] -= amount
     balance[receiver] += amount
+    databaseUpdate += 1
 
-#tell others to conduct transaction
-def sendConductTransaction(receiver, amount):
-    global metime
+def checkLock(ID):
+    if(ID in locks):
+        return locks[ID] > 0
+#adds a lock to an entry
+def addLock(ID, send, myLock=False):
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
+    print("locking: ",ID)
+    if ID not in locks:
+        locks[ID] = 1
+    else:
+        locks[ID] = min(3, locks[ID]+1)
+    if myLock:
+        mylocks.add(ID)
+        saveLocks()
+    if send:
+        for i in users:
+            if i != SERVER_PORT and i != 9000 and i != 8999:
+                serverSocket.sendto(f"Lock {ID}".encode(), ('127.0.0.1', i))
+
+#releases a lock to an entry
+def releaseLock(ID, send, myLock=False):
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
+    if ID in locks:
+        locks[ID] = max(0, locks[ID]-1)
+    if myLock:
+        if ID in mylocks:
+            mylocks.remove(ID)
+        saveLocks()
+    if send:
+        for i in users:
+            if i != SERVER_PORT and i != 9000 and i != 8999:
+                serverSocket.sendto(f"Unlock {ID}".encode(), ('127.0.0.1', i))
+    
+def everyoneLock(ID):
+    addLock(ID, False, True)
     for i in users:
-        if i != SERVER_PORT:
-            sleep(3)
-            metime += 1
-            serverSocket.sendto(f"transfer {receiver} {amount} {metime}".encode(), ('127.0.0.1', i))
-            print(f"   |     Local time changed: {metime-1} -> {metime}")
-            print(f"   | Message sent to {users[i]}: transfer {receiver} {amount} {metime}")
-            
+        if i != SERVER_PORT and i != 9000 and i != 8999:
+            serverSocket.sendto(f"EveryoneLock {ID}".encode(), ('127.0.0.1', i))
 
-#send request to all other servers
-def sendReq(requestTime, receiver, amount):
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, receivedAppendRPC, grantedVote, timer
-    #send request to all other servers	
+def everyoneUnlock(ID):
+    releaseLock(ID, False, True)
     for i in users:
-        if i != SERVER_PORT:
-            sleep(3)
-            metime += 1
-            serverSocket.sendto(f"request {requestTime} {receiver} {amount} {metime}".encode(), ('127.0.0.1', i))
-            print(f"   |     Local time changed: {metime-1} -> {metime}")
-            print(f"   | Message sent to {users[i]}: request {requestTime} {receiver} {amount} {metime}")
-            
+        if i != SERVER_PORT and i != 9000 and i != 8999:
+            serverSocket.sendto(f"EveryoneUnlock {ID}".encode(), ('127.0.0.1', i))
 
-#send release to all other servers
-def release():
-    global metime
-    #send release to all other servers
-    for i in users:
-        if i != SERVER_PORT:
-            sleep(3)
-            metime += 1
-            serverSocket.sendto(f"release {metime}".encode(), ('127.0.0.1', i))
-            print(f"   |     Local time changed: {metime-1} -> {metime}")
-            print(f"   | Message sent to {users[i]}: release {metime}")
+def saveLocks():
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
+    try:
+        with open(f'./saves/locks{MYID}.txt', 'x') as f:
+            dump = json.dumps(mylocks)
+            f.write(dump)
+    except FileExistsError:
+        with open(f'./saves/locks{MYID}.txt', 'w') as f:
 
+            dump = json.dumps([i for i in mylocks])
+            f.write(dump)
+
+
+def saveLog():
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
+    while(True):
+        saveLastApplied = lastApplied
+        while (lastApplied == saveLastApplied):
+            continue
+        with open(f'./saves/log{MYID}.txt', 'w') as f:
+            dump = json.dumps([entry.to_dict() for entry in log])
+            f.write(dump)
+        with open(f'./saves/lastApp{MYID}.txt', 'w') as f:
+            f.write(str(lastApplied))
+            f.write("\n")
+            f.write(str(commitIndex))
+
+def saveDatabase():
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
+
+    while(True):
+        saveDatabaseUpdate = databaseUpdate
+        while (databaseUpdate == saveDatabaseUpdate):
+            continue
+        with open(f'./saves/database{MYID}.txt', 'w') as f:
+            dump = json.dumps(balance)
+            f.write(dump)
 
 #starts an election because I want to be a leader :)))        
 def startElection():
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, receivedAppendRPC, grantedVote, timer
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
     #start electionTimer
     timer = electionTimeout
-    votes = 0
     currentTerm += 1
     state = 1
-    votes += 1
+    votes = 1
     votedFor = MYID
-    #send requestvotes  to everyone TODO:
     for i in users:
-        if i != SERVER_PORT:
-            sleep(sendDelay)
+        if i != SERVER_PORT and i != 9000 and i != 8999:
             lastLog = log[len(log)-1] if len(log)>0 else logEntry(0,0)
-            print(f"Sending RequestVote to {i}")
+            debug_print(f"Sending RequestVote to {i}")
             serverSocket.sendto(f"RequestVote {MYID} {currentTerm} {lastLog.index} {lastLog.term}".encode(), ('127.0.0.1', i))
-
 
     #wait until currentTerm is the same
     saveCurrentTerm = currentTerm
@@ -191,163 +176,143 @@ def startElection():
     while(currentTerm == saveCurrentTerm):
         #if votes is 5 become leader
         if(votes >= 2):
-            print("Im leader")
             currentLeader = MYID
             state = 2
+            print("I am the leader")
             nextIndex = {1 + (SHARDID*3): len(log)+1, 2 + (SHARDID*3): len(log)+1, 3 + (SHARDID*3): len(log)+1}
             matchIndex = {1 + (SHARDID*3): 0, 2 + (SHARDID*3): 0, 3 + (SHARDID*3): 0}
+            serverSocket.sendto(f"Leader {(MYID-1)//3} {MYID}".encode(), ('127.0.0.1', 9000))
+            serverSocket.sendto(f"Leader {(MYID-1)//3} {MYID}".encode(), ('127.0.0.1', 8999))
+
             threading.Thread(target=heartbeat).start()
+            threading.Thread(target=updateCommitIdx).start()
             break
-   
+
+def updateCommitIdx():
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
+    while(state == 2):
+        # If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+        for i in range(len(log), commitIndex, -1):
+            # debug_print("Checking for commit index", i)
+            if(log[i-1].term == currentTerm):
+                count = 0
+                for j in matchIndex:
+                    if(matchIndex[j] >= i):
+                        count += 1
+                if(count >= 2):
+                    commitIndex = i
+                    while(commitIndex > lastApplied):
+                        debug_print("CommitIndex", commitIndex)
+                        debug_print("APPLIED INDEX", lastApplied)
+                        applyIndex = log[lastApplied]
+                        commitTransaction(applyIndex.transaction[0], applyIndex.transaction[1], applyIndex.transaction[2])
+                        lastApplied += 1
+                    break
 
 
-def sendHeartbeat():
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, receivedAppendRPC, grantedVote, timer
-
-    for port in users:
-            if port != SERVER_PORT:
-                print(f"Sending Heartbeat to {port}")
-                if(len(log) > 1):
-                    prevLog = log[len(log)-2]
-                else:
-                    prevLog = logEntry(0,0)
-
-                serverSocket.sendto(f"AppendEntries {currentTerm} {MYID} {len(log)-1} {prevLog.term} {commitIndex} {0}...".encode(), ('127.0.0.1', port))
-
-def getID():
-    i = 0
-    while(i in ids):
-        i+=1
-    return i
-    
+def sendAppendMessage(id, port):
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
+    start = nextIndex[id]
+    debug_print("Start ", start)
+    entries = log[start-1:]
+    for entry in entries:
+        debug_print(entry)
+    prevLog = log[start-2] if start>1 else logEntry(0,0)
+    json_data = json.dumps([entry.to_dict() for entry in entries])
+    sendMess = f"AppendEntries {currentTerm} {MYID} {prevLog.index} {prevLog.term} {commitIndex}...{json_data}"
+    debug_print(sendMess)
+    serverSocket.sendto(sendMess.encode(), ('127.0.0.1', port))
 
 
-
-def conductIntra(split):
+def conductIntra(data, clientPort):
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
+    data = data.decode()
+    split = data.split()
     sender = int(split[1])
     receiver = int(split[2])
     amt = int(split[3])
-    if(state != 2):
-        serverSocket.sendto(f"IntraRequest {sender} {receiver} {amt}", 9000 + currentLeader) #TODO: what to do if currentLeader is none here
-    #TODO:
-    #get locks
+    if(len(split) > 4):
+        clientPort = int(split[4])
+    
     #check balances
     if(balance[sender] < amt):
-        #fail
-        #return
-        ...
+        serverSocket.sendto(f"RequestResponse No {MYID}".encode(), ('127.0.0.1', clientPort))
+        return
+
+    #check locks
+    if(checkLock(sender) or checkLock(receiver)):
+        serverSocket.sendto(f"RequestResponse No {MYID}".encode(), ('127.0.0.1', clientPort))
+        return
+    everyoneLock(sender)
+    everyoneLock(receiver)
     
-    entry = logEntry(len(log)+1, currentTerm, (sender, receiver, amt), "intra")
+
+    if(state != 2):
+        if(currentLeader == None):
+            serverSocket.sendto(f"RequestResponse No {MYID}".encode(), ('127.0.0.1', clientPort))
+            return
+        serverSocket.sendto(f"IntraRequest {sender} {receiver} {amt} {clientPort}".encode(), ('127.0.0.1', 9000 + currentLeader))
+        return
+    
+    entry = logEntry(len(log)+1, currentTerm, (sender, receiver, amt), "I")
     #append command to log
     log.append(entry)
-    #checking for majority table
-    transactionID = getID()
-    reqVotes[transactionID] = 1
-    
+    #update nextIndex and matchIndex
+    matchIndex[MYID] = len(log)
+    nextIndex[MYID] = len(log)+1
     #send append rpcs to followers
-
-    for port,id in users:
-        if port != SERVER_PORT:
-            sleep(sendDelay)
-            print(f"Sending AppendRPC to {port}")
+    sleep(sendDelay)
+    for port,id in users.items():
+        if port != SERVER_PORT and port != 9000 and port != 8999:
+            debug_print(f"Sending AppendRPC to {port}")
             #if last index >= nextindex
             if(nextIndex[id] <= len(log)):
-                start = nextIndex[id]
-                entries = log[start-1:]
-                prevLog = log[len(log)-2] if len(log)>1 else logEntry(0,0)
-                json_data = json.dumps([entry.to_dict() for entry in entries])
-                serverSocket.sendto(f"AppendEntries {currentTerm} {MYID} {prevLog.index} {prevLog.term} {commitIndex} {transactionID}...{json_data}".encode(), ('127.0.0.1', port))
-    
-    #if heard from majority commited
-    
-    while(reqVotes[transactionID]==1):
+                sendAppendMessage(id, port)
+    #wait until you have committed the index
+    while(commitIndex < entry.index):
         continue
-    
-    #commit
-
-    
-    #notify follows of committed entries
-            
+    #TODO: release locks    
+    everyoneUnlock(sender)
+    everyoneUnlock(receiver)
     #tell user
+    serverSocket.sendto(f"RequestResponse Yes {MYID}".encode(), ('127.0.0.1', clientPort))
     
 
 
-def get_user_input():
-    global blockchain, balance, metime, users, requests, replies
-    while True:
-        try:
-            userInput = input()
-            # close all sockets before exiting
-            if userInput == "Transfer":
-                print("Who do you want to transfer to? Options are users", *[i for i in range(3) if i != MYID])
-                try:
-                    receiver = int(input())
-                except ValueError:
-                    print("FAILED: Invalid receiver")
-                    continue
-                print(f"How much do you want to transfer (current is ${balance[MYID]})?")
-                try:
-                    amount = int(input())
-                except ValueError:
-                    print("FAILED: Invalid receiver")
-                    continue
-                if receiver == MYID:
-                    print("FAILED: Cannot transfer to self")
-                    continue
-                if receiver not in [0,1,2]:
-                    print("FAILED: Invalid receiver")
-                    continue
-                print("Transfer Initiated...")
-                requestTime = metime
-                heapq.heappush(requests, (int(requestTime), int(MYID), int(receiver), int(amount)))
-                replies[requestTime] = 0
-
-                sendReq(requestTime, receiver, amount)
-                while ((replies[requestTime] < 2) or (requests[0][:2] != (requestTime, MYID))):
-                    continue
-                #I have mutex to do the transaction
-                if balance[MYID] < amount:
-                    print("FAILED: Insufficient Balance")
-                else:
-                    conductTransaction(MYID, receiver, amount)
-                    sendConductTransaction(receiver, amount)
-                    print(f"SUCCESS: Your balance is now ${balance[MYID]}")
-                release()
-                heapq.heappop(requests) #removes the request from the queue
-
-            #print all balances
-            elif userInput == "Balance":
-                print(f"Your Balance is ${balance[MYID]}")
-            elif userInput == "Blockchain":
-                stringChain = ""
-                if len(blockchain) != 0:
-                    for i in blockchain:
-                        stringChain += i.print() + "\n"
-                    print(stringChain[:-2])
-                else:
-                    print("[]")
-            elif userInput == "Balance Table":
-                print(" Balances: \n", *[f" \tUser {i}:${balance[i]}\n" for i in balance])
-            elif userInput == "exit":
-                serverSocket.close()
-                _exit(0)
-        except EOFError or AttributeError or IndexError:
-            continue
-
+#given an index to revert back to, check lastApplied 
+def fixLog(prevIdx):
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
+    if(lastApplied <= prevIdx):
+        log = log[:prevIdx]
+    else:
+        #clean up everything after prevIdx, to lastApplied
+        for i in range(prevIdx, lastApplied-1):
+            #i is actual index in log
+            balance[log[i].transaction[0]] += log[i].transaction[2]
+            balance[log[i].transaction[1]] -= log[i].transaction[2]
+        log = log[:prevIdx]
+        
 
 
 def handle_msg(data, port):
-    global blockchain, balance, metime, users, requests, replies
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, receivedAppendRPC, grantedVote, timer
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
     # simulate 3 seconds message-passing delay
     # decode byte data into a string
     data = data.decode()
+    debug_print(data)
     # echo message to console
     if(data[:2] == "Hi"):
         if(port not in users.keys()):
             users[port] = int(data[3:])
-            serverSocket.sendto(f"Hi {sys.argv[1]}".encode(), ('127.0.0.1', port))
             print("connected to", users[port])
+        serverSocket.sendto(f"Done {sys.argv[1]}".encode(), ('127.0.0.1', port))
+    
+    if(data[:4] == "Done"):
+        if(port not in users.keys()):
+            users[port] = int(data[5:])
+            print("connected to", users[port])
+    if(port not in users.keys()):
+        return
     sender = int(users[port])
 
     if(data[:11] == "RequestVote"):
@@ -357,23 +322,20 @@ def handle_msg(data, port):
         candLastIdx = int(split[3])
         candLastTerm = int(split[4])
         currLastLog = log[len(log)-1] if len(log)>0 else logEntry(0,0)
-
-        if ((currentTerm < candTerm) or (currentTerm == candTerm and (votedFor == None or votedFor == candId) and (candLastTerm > currLastLog.term or (candLastTerm == currLastLog.term and candLastIdx >= currLastLog.index)))):
+        if (currentTerm <= candTerm and (votedFor == None or votedFor == candId) and (candLastTerm > currLastLog.term or (candLastTerm == currLastLog.term and candLastIdx >= currLastLog.index))):
             timer = electionTimeout
             currentTerm = candTerm
             votedFor = candId
             #become follower
             state= 0
             votes = 0
-            sleep(sendDelay)
-            print("voting yes")
+            debug_print("voting yes")
             serverSocket.sendto(f"VoteResponse {currentTerm} Yes".encode(), ('127.0.0.1', port))
         else:
-            sleep(sendDelay)
-            print("voting no")
+            debug_print("voting no")
             serverSocket.sendto(f"VoteResponse {currentTerm} No".encode(), ('127.0.0.1', port))
 
-    if(data[:12] == "VoteResponse"):
+    elif(data[:12] == "VoteResponse"):
         split = data.split()
         responseTerm = int(split[1])
         voteGranted = split[2]
@@ -382,143 +344,192 @@ def handle_msg(data, port):
             state = 0
         elif (voteGranted == "Yes"):
             votes += 1        
-            
-
-
-
 
     #when I get a request, add request to quee and send a reply
-    if(data[:12] == "IntraRequest"):
-        threading.Thread(target=conductIntra, args=(data.split())).start()
+    elif(data[:12] == "IntraRequest"):
+        debug_print(data)
+        threading.Thread(target=conductIntra, args=(data.encode(),port,)).start()
     
-    if(data[:13] == "AppendEntries"):
-        timer = electionTimeout
-        print("timer updated to ", timer)
+    elif(data[:13] == "AppendEntries"):
+        # debug_print(f"   | Message received from {sender}: {data}")
         split = data.split("...")
         values = split[0]
-        entries = json.load(split[1]) if split[1] != '' else ''
-        print(entries)
+        entries = json.loads(split[1]) if split[1] != '' else ''
         valuesplit = values.split()
         reqTerm =  int(valuesplit[1])
         reqID = int(valuesplit[2])
         reqPrevIdx = int(valuesplit[3])
         reqPrevTerm =   int(valuesplit[4])
         reqComIdx = int(valuesplit[5])
-        transID = int(valuesplit[6])
-        timer = electionTimeout
+        #if term is greater than currentTerm, become follower
         if(reqTerm >= currentTerm):
             state = 0
             currentTerm = reqTerm
             currentLeader = reqID
-
-        checkLog = log[reqPrevIdx-1] if len(log) > 0 else logEntry(0,0) 
-        if(entries == '' or reqTerm < currentTerm or reqPrevIdx > len(log) or (checkLog.term != reqPrevTerm)):
-            serverSocket.sendto(f"AppendResponse {currentTerm} No {reqPrevIdx} {transID}".encode(), ('127.0.0.1', port))
+            timer = electionTimeout
+        #its a heartbeat
+        if(entries == ''):
+            # debug_print("Entries is empty") its an heartbeat
+            serverSocket.sendto(f"AppendResponse {currentTerm} No -1".encode(), ('127.0.0.1', port))
         else:
-            #delete everything past index
-            log = log[:reqPrevIdx]
-            for i in entries:
-                log.append(i)
-            serverSocket.sendto(f"AppendResponse {currentTerm} Yes {len(log)} {transID}".encode(), ('127.0.0.1', port))
-        if(reqComIdx > commitIndex): commitIndex = min(reqComIdx, len(log))
-        
-        
-    if(data[:14] == "AppendResponse"):
+            debug_print("Received: ", data)
+            
+            #get the prevIdx log to check
+            checkLog = log[reqPrevIdx-1] if (len(log) > 0 and reqPrevIdx > 0) else logEntry(0,0) 
+            if(reqTerm < currentTerm):
+                debug_print("case1")
+                sending = f"AppendResponse {currentTerm} No {reqPrevIdx}"
+                debug_print(sending)
+                serverSocket.sendto(sending.encode(), ('127.0.0.1', port))
+            elif(reqPrevIdx > len(log)):
+                debug_print("case2")
+                sending = f"AppendResponse {currentTerm} No {reqPrevIdx}"
+                debug_print(sending)
+                serverSocket.sendto(sending.encode(), ('127.0.0.1', port))
+            elif(checkLog.term != reqPrevTerm):
+                debug_print("case3")
+                sending = f"AppendResponse {currentTerm} No {reqPrevIdx}"
+                debug_print(sending)
+                serverSocket.sendto(sending.encode(), ('127.0.0.1', port))
+            else:
+                #delete everything past index
+                debug_print("ReqPrevIdx", reqPrevIdx)
+                fixLog(reqPrevIdx)
+                entries = [logEntry.from_dict(item) for item in entries]
+                for i in entries:
+                    log.append(i)
+                for i in log:
+                    debug_print(i)
+                sending = f"AppendResponse {currentTerm} Yes {len(log)}"
+                serverSocket.sendto(sending.encode(), ('127.0.0.1', port))
+            #set commit index based on what the leader knows 
+        if(reqComIdx > commitIndex and state != 2):
+            commitIndex = min(reqComIdx, len(log))
+            while(commitIndex > lastApplied):
+                debug_print("APPLIED INDEX", lastApplied)
+                applyIndex = log[lastApplied]
+                commitTransaction(applyIndex.transaction[0], applyIndex.transaction[1], applyIndex.transaction[2])
+                lastApplied += 1
+
+    elif(data[:14] == "AppendResponse"):
         split = data.split()
         term = int(split[1])
         response = split[2]
         nextLog = int(split[3])
-        transID = int(split[4])
+        # debug_print("nextLog ",nextLog)
+        debug_print(f"{sender}: {data}")
+    
         if(term > currentTerm):
+            debug_print("becoming follower")
             state = 0
             currentTerm = term
+        elif(nextLog < 0):
+            ...
         elif(response == "Yes"):
+            # debug_print("nextLog ",nextLog)
             nextIndex[sender] = nextLog + 1
             matchIndex[sender] = nextLog
-            reqVotes[transID] += 1
         elif(response == "No"):
-            nextIndex[sender] = nextLog - 1
+            nextIndex[sender] = nextLog
+            sendAppendMessage(sender, port)
             #ask them again with a smaller nextIndex
-        
+    elif(data == "PrintDatastore"):
+        print("Datastore:\n")
+        for i in range(0, commitIndex):
+            print(log[i])
+    elif(data[:12] == "PrintBalance"):
+        entryID = int(data.split()[1])
+        serverSocket.sendto(f"PrintBalance {balance[entryID]}".encode(), ('127.0.0.1', port))
+    elif(data == "makeleader"):
+        threading.Thread(target=startElection).start()
+    elif(data[:4] == "Lock"):
+        ID = int(data.split()[1])
+        addLock(ID, False)
+    elif(data[:6] == "Unlock"):
+        ID = int(data.split()[1])
+        releaseLock(ID, False)
+    elif(data[:12] == "EveryoneLock"):
+        ID = int(data.split()[1])
+        #achnowledge the incoming lock
+        addLock(ID, False, True)
+        #tell everyone that you have the lock as well
+        addLock(ID, True, False)
+    elif(data[:14] == "EveryoneUnlock"):
+        ID = int(data.split()[1])
+        #acknowledge the incoming unlock
+        releaseLock(ID, False, True)
+        #tell everyone that you released the lock
+        releaseLock(ID, True, False)
+    elif data == "exit":
+                serverSocket.close()
+                _exit(0)
 
-        
 
-
-        
-
-    #when I get a release, remove the request from the queue
-    if(data[:7] == "release"):
-        print(f"   | Message received from {sender}: {data}")
-        heapq.heappop(requests)
-        split = data.split()
-        incomeTime = int(split[1])
-        if incomeTime > metime:
-            metime = incomeTime + 1
-            print(f"   |     Local time changed: {metime-1} -> {metime}")
-        else:
-            metime += 1
-            print(f"   |     Local time changed: {metime-1} -> {metime}")
-    
-    if(data[:8] == "transfer"):
-        print(f"   | Message received from {sender}: {data}")
-        split = data.split()
-        receiver = int(split[1])
-        amt = int(split[2])
-        incomeTime = int(split[3])
-        if incomeTime > metime:
-            metime = incomeTime + 1
-            print(f"   |     Local time changed: {metime-1} -> {metime}")
-        else:
-            metime += 1
-            print(f"   |     Local time changed: {metime-1} -> {metime}")
-        conductTransaction(sender, receiver, amt)
-    
-    if(data[:5] == "reply"):
-        print(f"   | Message received from {sender}: {data}")
-        split = data.split()
-        replies[int(split[1])] += 1
-        incomeTime = int(split[2])
-        if incomeTime > metime:
-            metime = incomeTime + 1
-            print(f"   |     Local time changed: {metime-1} -> {metime}")
-        else:
-            metime += 1
-            print(f"   |     Local time changed: {metime-1} -> {metime}")
-
+def get_user_input():
+    while True:
+        try:
+            userInput = input()
+            # close all sockets before exiting
+            if userInput == "exit":
+                serverSocket.close()
+                _exit(0)
+            elif userInput == "locks":
+                print(locks)
+        except EOFError or AttributeError or IndexError:
+            continue
 
 #starts elections if haven't heard in a bit
 def handleElectionTimeout():
-    global timer
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
     while(1):
         if (timer > 0 or state == 2): continue
         #if haven't received a rpc yet (leader has crashed) and isn't in the middle of an election start an election
-        print("starting election")
+        debug_print("starting election")
         threading.Thread(target=startElection).start()
         timer = electionTimeout
 
 
 def subtractTimer():
-    global timer
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
     while(1):
         sleep(.03)
         timer -= .03
 
 
-def heartbeat():#TODO: when become leader call heartbeat
+def sendHeartbeat():
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks
+
+    for port in users:
+            if port != SERVER_PORT and port != 9000 and port != 8999:
+                # debug_print(f"Sending Heartbeat to {port}")
+                if(len(log) > 1):
+                    prevLog = log[len(log)-2]
+                else:
+                    prevLog = logEntry(0,0)
+                print(f"Heartbeat {commitIndex}...")
+                serverSocket.sendto(f"AppendEntries {currentTerm} {MYID} {prevLog.index} {prevLog.term} {commitIndex}...".encode(), ('127.0.0.1', port))
+
+def heartbeat():#when become leader call heartbeat
     while(state == 2):
             sleep(1)
             threading.Thread(target=sendHeartbeat).start()
 
-
 #initializes connections betweens servers
 def connect():
-    sleep(3)
     #client is 9000
-    users = [9001+ (SHARDID*3),9002+ (SHARDID*3),9003+ (SHARDID*3)]
+    users = [8999, 9000, 9001+ (SHARDID*3),9002+ (SHARDID*3),9003+ (SHARDID*3)]
     for i in users:
         if i != SERVER_PORT:
-            print("connecting to", i)
+            print("connecting to ", i)
             serverSocket.sendto(f"Hi {sys.argv[1]}".encode(), ('127.0.0.1', i))
+
+def debug_print(*args, **kwargs):
+    """
+    Print only if DEBUG is True.
+    Accepts any arguments that a normal print function would.
+    """
+    if DEBUG:
+        print(*args, **kwargs)
 
 #inits
 if __name__ == "__main__":
@@ -526,21 +537,69 @@ if __name__ == "__main__":
     MYID = int(sys.argv[1])
     SERVER_PORT = int(sys.argv[2])
     SHARDID = (MYID-1)//3
-    print(SERVER_PORT)
-    balance = {1 + (SHARDID*3): 10, 2 + (SHARDID*3): 10, 3 + (SHARDID*3): 10}
+    debug_print(SERVER_PORT)
+    parser = argparse.ArgumentParser(description="Run server")
+    parser.add_argument("--debug", action="store_true", help="Turn on debugger statements")
+    args, unknown = parser.parse_known_args()
+    if args.debug:
+        DEBUG = True
+    try:
+        with open(f'./saves/database{MYID}.txt', 'r') as f:
+            if f.read() == '':
+                for i in range(1+SHARDID*1000,1001+SHARDID*1000):
+                    balance[i] = 10
+            else:
+                f.seek(0)
+                dict = json.load(f)
+                balance = {int(k): int(v) for k, v in dict.items()}
+    except FileNotFoundError:
+        with open(f'./saves/database{MYID}.txt', 'x') as f:
+            ...
+        for i in range(1+SHARDID*1000,1001+SHARDID*1000):
+            balance[i] = 10
+    try:
+        with open(f'./saves/log{MYID}.txt', 'r') as f:
+            if f.read() != '':
+                f.seek(0)
+                log = [logEntry.from_dict(item) for item in json.load(f)]
+    except FileNotFoundError:
+        with open(f'./saves/log{MYID}.txt', 'x') as f:
+            ...
+    try:
+        with open(f'./saves/lastApp{MYID}.txt', 'r') as f:
+            if f.read() != '':
+                f.seek(0)
+                lastApplied = int(f.readline())
+                print(lastApplied)
+                commitIndex = int(f.readline())
+                print(commitIndex)
+    except FileNotFoundError:
+        with open(f'./saves/lastApp{MYID}.txt', 'x') as f:
+            ...
+    try:
+        with open(f'./saves/locks{MYID}.txt', 'r') as f:
+            if f.read() != '':
+                f.seek(0)
+                mylocks = set(json.load(f))
+                for i in mylocks: 
+                    releaseLock(i, True)
+    except FileNotFoundError:
+        with open(f'./saves/locks{MYID}.txt', 'x') as f:
+            ...
     # threading.Thread(target=initialize).start()
     serverSocket = socket(AF_INET, SOCK_DGRAM)
     serverSocket.bind(('', SERVER_PORT))
-    electionTimeout = random.random()*5 + 5
+    electionTimeout = random.random()*10 + sendDelay
     timer = electionTimeout
-    print("Server is up and running")
+    debug_print("Server is up and running")
     serverSocket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-    threading.Thread(target=get_user_input).start()
     threading.Thread(target=connect).start()
-
     threading.Thread(target=subtractTimer).start()
     threading.Thread(target=handleElectionTimeout).start()
-    print("Current balance is $10")
+    threading.Thread(target=saveLog).start()
+    threading.Thread(target=get_user_input).start()
+
+    threading.Thread(target=saveDatabase).start()
     while True:
         try:
             message, clientAddress = serverSocket.recvfrom(2048)

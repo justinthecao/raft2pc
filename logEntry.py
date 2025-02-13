@@ -1,7 +1,3 @@
-SHARDID = 3
-users = [9001+ (SHARDID*3),9002+ (SHARDID*3),9003+ (SHARDID*3)]
-print(users)
-
 class logEntry():
     #type of entry
     t = None
@@ -11,7 +7,7 @@ class logEntry():
     term = None
     #transactions are in the form (sender, receiver, amount)
     transaction = None
-
+   
     def __init__(self, index, term, trans=None, t=None):
         self.t = t
         self.index = index
@@ -40,6 +36,7 @@ class logEntry():
     def __str__(self):
         return (
             "(\n"
+            + f"\tType: {self.t}\n"
             + f"\tIndex: {self.index}\n"
             + f"\tTerm: {self.term}\n"
             + f"\tSender: {self.transaction[0]}\n"
@@ -47,18 +44,3 @@ class logEntry():
             + f"\tAmount: {self.transaction[2]}\n"
             + ")\n"
         )
-        
-prevLog = logEntry(index=0,term=0)
-
-
-data = f"AppendEntries asfdjkl sdaf jklsdaf  ...... a"
-split = data.split("...")
-print(split)
-
-for i in range(9):
-    print(i)
-
-import json
-
-print(json.loads("""[{"t": "intra", "index": 1, "term": 1, "transaction": [1, 2, 3]}]"""))
-
