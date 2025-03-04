@@ -1,5 +1,22 @@
 import os
 for i in range(1,10):
-    os.remove(f"./saves/database{i}.txt")
-    os.remove(f"./saves/lastApp{i}.txt")
-    os.remove(f"./saves/log{i}.txt")
+    try:
+        os.remove(f"./saves/database{i}.txt")
+    except:
+        pass
+    try:
+        os.remove(f"./saves/database{i}.txt")
+    except:
+        pass
+    try:
+        os.remove(f"./saves/lastApp{i}.txt")
+    except:
+        pass
+    try:
+        os.remove(f"./saves/log{i}.txt")
+    except:
+        pass
+    try:
+        os.remove(f"./saves/locks{i}.txt")
+    except:
+        pass
