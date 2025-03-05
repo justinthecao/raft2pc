@@ -72,8 +72,6 @@ DEBUG = False  # or False to turn off debug output
 databaseUpdate = 0
 
 databaselock = threading.Lock()
-lastAppliedLock = threading.Lock()
-commitIndexLock = threading.Lock()
 saveDatabaseSem = threading.Semaphore(0)
 conductTranLock = threading.Lock()
 updatelocks = threading.Lock()
@@ -84,8 +82,8 @@ def commitTransaction(sender, receiver, amount):
     global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
     balance[sender] -= amount
     balance[receiver] += amount
-    print(f"balance of {sender} is {balance[sender]}")
-    print(f"balance of {receiver} is {balance[receiver]}")
+    debug_print(f"balance of {sender} is {balance[sender]}")
+    debug_print(f"balance of {receiver} is {balance[receiver]}")
     saveDatabaseSem.release()
 
 def commitCross(entry, amount):
@@ -100,7 +98,7 @@ def checkLock(ID):
 #adds a lock to an entry
 def addLock(ID, send, myLock=False):
     global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
-    print("locking: ",ID)
+    debug_print("locking: ",ID)
     with updatelocks:
         if ID not in locks:
             locks[ID] = 1
@@ -118,7 +116,7 @@ def addLock(ID, send, myLock=False):
 def releaseLock(ID, send, myLock=False):
     global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
     with updatelocks:
-        print("unlocking: ",ID)
+        debug_print("unlocking: ",ID)
         ID = int(ID)
         if ID in locks:
             locks[ID] = max(0, locks[ID]-1)
@@ -160,7 +158,7 @@ def saveLog():
     global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
     while(True):
         saveDatabaseSem.acquire()
-        print("saving")
+        debug_print("saving")
         with open(f'./saves/log{MYID}.txt', 'w') as f:
             dump = json.dumps([entry.to_dict() for entry in log])
             f.write(dump)
@@ -181,7 +179,7 @@ def startElection():
     #start electionTimer
     timer = electionTimeout
     currentTerm += 1
-    print("currentTerm", currentTerm)
+    debug_print("currentTerm", currentTerm)
     state = 1
     votes = 1
     votedFor = MYID
@@ -199,7 +197,7 @@ def startElection():
         if(votes >= 2):
             currentLeader = MYID
             state = 2
-            print("I am the leader")
+            debug_print("I am the leader")
             #contains the next log index to send to each server
             #this is not an actual index
             nextIndex = {1 + (SHARDID*3): len(log)+1, 2 + (SHARDID*3): len(log)+1, 3 + (SHARDID*3): len(log)+1}
@@ -222,7 +220,7 @@ def applyLog(applyIndex):
     #if its a cross commit apply the cross
     #and the load one
     #and also the fix
-    print("applying ", applyIndex)
+    debug_print("applying ", applyIndex)
 
     if applyIndex.t == LETypes.INTRA.value:
         releaseLock(applyIndex.transaction[0], True, True)
@@ -232,13 +230,13 @@ def applyLog(applyIndex):
         crossTrans = log[applyIndex.transaction[0]-1]
         isSender = (crossTrans.transaction[0]-1)//1000 == SHARDID
         if applyIndex.transaction[1] == 1:
-            print("applying cross ", crossTrans)
+            debug_print("applying cross ", crossTrans)
             if isSender:
                 commitCross(crossTrans.transaction[0], -1 * crossTrans.transaction[2])
-                print(f"balance of {crossTrans.transaction[0]} is {balance[crossTrans.transaction[0]]}")
+                debug_print(f"balance of {crossTrans.transaction[0]} is {balance[crossTrans.transaction[0]]}")
             else:    
                 commitCross(crossTrans.transaction[1], crossTrans.transaction[2])
-                print(f"balance of {crossTrans.transaction[1]} is {balance[crossTrans.transaction[1]]}")
+                debug_print(f"balance of {crossTrans.transaction[1]} is {balance[crossTrans.transaction[1]]}")
     saveDatabaseSem.release()
                     
 def updateCommitIdx():
@@ -316,34 +314,38 @@ def conductIntra(data, clientPort):
     #         serverSocket.sendto(f"IntraResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
     #         return
     #TODO: possible change, if there is no leader, we can deny the request, just make the leader change faster?
+    for i in log:
+        if i.requestID == requestID:
+            debug_print(f"{sender} {receiver} {amt} {requestID} already in log")
+            debug_print("Already in log")
+            return
+    if(checkLock(sender) or checkLock(receiver)):
+        serverSocket.sendto(f"IntraResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
+        return  
+    if(state != 2):
+        #server has no one to forward to return no
+        pendingEntries.append((data, clientPort))
+        #forward to leader
+        if(currentLeader != None):
+            serverSocket.sendto(f"IntraRequest {sender} {receiver} {amt} {requestID} {clientPort}".encode(), ('127.0.0.1', 9000 + currentLeader))
+        return
+
     with conductTranLock:
         for i in log:
             if i.requestID == requestID:
-                print(f"{sender} {receiver} {amt} {requestID} already in log")
-                debug_print("Already in log")
+                debug_print(f"{sender} {receiver} {amt} {requestID} already in log")
                 return
         
+        debug_print('got passed log check')
         
-        print('got passed log check')
-        if(state != 2):
-            #server has no one to forward to return no
-            pendingEntries.append((data, clientPort))
-            #forward to leader
-            if(currentLeader != None):
-                serverSocket.sendto(f"IntraRequest {sender} {receiver} {amt} {requestID} {clientPort}".encode(), ('127.0.0.1', 9000 + currentLeader))
-            return
         #server is a leader
         #check balances
         if(balance[sender] < amt):
             serverSocket.sendto(f"IntraResponse No {requestID} {MYID} 1".encode(), ('127.0.0.1', clientPort))
-
             return
-
-        #check locks
         if(checkLock(sender) or checkLock(receiver)):
             serverSocket.sendto(f"IntraResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
-            
-            return
+            return  
         
         everyoneLock(sender)
         everyoneLock(receiver)
@@ -352,7 +354,7 @@ def conductIntra(data, clientPort):
 
         #append command to log
         log.append(entry)
-        print("entry added ", entry)
+        debug_print("entry added ", entry)
         #update nextIndex and matchIndex
         matchIndex[MYID] = len(log)
         nextIndex[MYID] = len(log)+1
@@ -364,11 +366,13 @@ def conductIntra(data, clientPort):
                 #if last index >= nextindex
                 if(nextIndex[id] <= len(log)):
                     sendAppendMessage(id, port)
-        #wait until you have committed the index
-        while(commitIndex < entry.index):
-            continue
-        #tell user
-        serverSocket.sendto(f"IntraResponse Yes {requestID} {MYID}".encode(), ('127.0.0.1', clientPort))
+    #wait until you have committed the index
+    while(commitIndex < entry.index):
+        continue
+    #tell user
+    reply = f"IntraResponse Yes {requestID} {MYID}"
+    debug_print(f"replying to client {clientPort} ", reply)
+    serverSocket.sendto(f"IntraResponse Yes {requestID} {MYID}".encode(), ('127.0.0.1', clientPort))
 
     
 
@@ -392,35 +396,50 @@ def conductCross(data, clientPort):
     #         serverSocket.sendto(f"CrossResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
     #         return
     #TODO: possible change, if there is no leader, we can deny the request, just make the leader change faster?
+    
+    #Prechecks...
+    for i in log:
+        if i.requestID == requestID:
+            debug_print(f"{sender} {receiver} {amount} {requestID} already in log")
+            return
+    
+    isSenderShard = (int(sender)-1)//1000 == SHARDID
+    #RAFT consists of getting locks and getting consensus
+    if isSenderShard and checkLock(sender):
+            serverSocket.sendto(f"CrossResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
+            return
+    if not isSenderShard and checkLock(receiver):
+        serverSocket.sendto(f"CrossResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
+        return
+    
+    if(state != 2):
+        pendingEntries.append((data, clientPort))
+        if(currentLeader != None):
+            serverSocket.sendto(f"CrossRequest {sender} {receiver} {amount} {requestID} {clientPort}".encode(), ('127.0.0.1', 9000 + currentLeader))
+        return
+   
     with conductTranLock:
+        #check the logs again
         for i in log:
             if i.requestID == requestID:
-                print(f"{sender} {receiver} {amount} {requestID} already in log")
+                debug_print(f"{sender} {receiver} {amount} {requestID} already in log")
                 return
-        
-        if(state != 2):
-            pendingEntries.append((data, clientPort))
-            if(currentLeader != None):
-                serverSocket.sendto(f"CrossRequest {sender} {receiver} {amount} {requestID} {clientPort}".encode(), ('127.0.0.1', 9000 + currentLeader))
-            return
-        
-        isSenderShard = (int(sender)-1)//1000 == SHARDID
-        print("isSenderShard", isSenderShard)
+            
+        debug_print("isSenderShard", isSenderShard)
         #check balance
         if(isSenderShard):
             if balance[int(sender)] < int(amount):
                 serverSocket.sendto(f"CrossResponse No {requestID} {MYID} 1".encode(), ('127.0.0.1', clientPort))
                 return
-            
+        
         #RAFT consists of getting locks and getting consensus
         if isSenderShard and checkLock(sender):
                 serverSocket.sendto(f"CrossResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
                 return
+        
         if not isSenderShard and checkLock(receiver):
             serverSocket.sendto(f"CrossResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
             return
-
-        
         #lock sender and receiver values
         if isSenderShard:
             everyoneLock(sender)
@@ -429,7 +448,7 @@ def conductCross(data, clientPort):
         
         #both sender and receiver need to get consensus, add block
         entry = logEntry(len(log)+1, currentTerm, (sender, receiver, amount), LETypes.CROSS.value, requestID)
-        print("entry added ", entry)
+        debug_print("entry added ", entry)
         log.append(entry)
 
         matchIndex[MYID] = len(log)
@@ -444,15 +463,15 @@ def conductCross(data, clientPort):
 
         #if got consensus, reply to client
 
-        while(commitIndex < entry.index):
-            continue
-        #wait for client to reply commit block
-        reply = f"CrossResponse Yes {requestID} {MYID}"
+    while(commitIndex < entry.index):
+        continue
+    #wait for client to reply commit block
+    reply = f"CrossResponse Yes {requestID} {MYID}"
 
-        debug_print(f"replying to client {clientPort} ", reply)
-        serverSocket.sendto(reply.encode(), ('127.0.0.1', clientPort))
-        #should tell me what block to commit?
-        #release locks
+    debug_print(f"replying to client {clientPort} ", reply)
+    serverSocket.sendto(reply.encode(), ('127.0.0.1', clientPort))
+    #should tell me what block to commit?
+    #release locks
 
 
 
@@ -464,12 +483,12 @@ def conductCross(data, clientPort):
 #given an index to revert back to, check lastApplied 
 def fixLog(prevIdx):
     global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
-    print("fixing log", prevIdx)
+    debug_print("fixing log", prevIdx)
     with databaselock:
             if(lastApplied <= prevIdx):
                 log = log[:prevIdx]
             else:
-                print("cleaning if fixUP")
+                debug_print("cleaning if fixUP")
                 #clean up everything after prevIdx, to lastApplied
                 for i in range(prevIdx, lastApplied):
                     #i is actual index in log
@@ -477,23 +496,23 @@ def fixLog(prevIdx):
                         
                         balance[log[i].transaction[0]] += log[i].transaction[2]
                         balance[log[i].transaction[1]] -= log[i].transaction[2]
-                        print("reverting index ", i)
-                        print("reverting intra ", log[i])
-                        print("balance of ", log[i].transaction[0], " is ", balance[log[i].transaction[0]])
-                        print("balance of ", log[i].transaction[1], " is ", balance[log[i].transaction[1]])
+                        debug_print("reverting index ", i)
+                        debug_print("reverting intra ", log[i])
+                        debug_print("balance of ", log[i].transaction[0], " is ", balance[log[i].transaction[0]])
+                        debug_print("balance of ", log[i].transaction[1], " is ", balance[log[i].transaction[1]])
 
                     elif log[i].t == LETypes.CROSSDECISION.value:
 
                         revertCrossTran = log[log[i].transaction[0]-1]
                         if log[i].transaction[1] == 1:
-                            print("reverting cross ", revertCrossTran)
+                            debug_print("reverting cross ", revertCrossTran)
                             
                             if revertCrossTran.transaction[0] in balance:
                                 balance[revertCrossTran.transaction[0]] += revertCrossTran.transaction[2]
-                                print(f"balance of {revertCrossTran.transaction[0]} is {balance[revertCrossTran.transaction[0]]}")
+                                debug_print(f"balance of {revertCrossTran.transaction[0]} is {balance[revertCrossTran.transaction[0]]}")
                             else:
                                 balance[revertCrossTran.transaction[1]] -= revertCrossTran.transaction[2]
-                                print(f"balance of {revertCrossTran.transaction[1]} is {balance[revertCrossTran.transaction[1]]}")
+                                debug_print(f"balance of {revertCrossTran.transaction[1]} is {balance[revertCrossTran.transaction[1]]}")
                 log = log[:prevIdx]
                 debug_print("cleaned up")
                 debug_print("log after cleanup")
@@ -505,7 +524,7 @@ def fixLog(prevIdx):
 
 
             # commitIndex = min(commitIndex, prevIdx)
-    print("done fixing log")
+    debug_print("done fixing log")
         
 
 
@@ -519,13 +538,13 @@ def handle_msg(data, port):
     if(data[:2] == "Hi"):
         if(port not in users.keys()):
             users[port] = int(data[3:])
-            print("connected to", users[port])
+            debug_print("connected to", users[port])
         serverSocket.sendto(f"Done {sys.argv[1]}".encode(), ('127.0.0.1', port))
     
     if(data[:4] == "Done"):
         if(port not in users.keys()):
             users[port] = int(data[5:])
-            print("connected to", users[port])
+            debug_print("connected to", users[port])
     if(port not in users.keys()):
         return
     sender = int(users[port])
@@ -537,7 +556,7 @@ def handle_msg(data, port):
         candLastIdx = int(split[3])
         candLastTerm = int(split[4])
         currLastLog = log[len(log)-1] if len(log)>0 else logEntry(0,0)
-        print("votedFor,   ", votedFor)
+        debug_print("votedFor,   ", votedFor)
         if (((currentTerm == candTerm and (votedFor == None or votedFor == candId)) or (currentTerm < candTerm)) and (candLastTerm > currLastLog.term or (candLastTerm == currLastLog.term and candLastIdx >= currLastLog.index))):
             timer = electionTimeout
             currentTerm = candTerm
@@ -618,7 +637,7 @@ def handle_msg(data, port):
                     debug_print("ReqPrevIdx", reqPrevIdx)
                     fixLog(reqPrevIdx)
                     entries = [logEntry.from_dict(item) for item in entries]
-                    print("Entries: ", entries)
+                    debug_print("Entries: ", entries)
                     for i in entries:
                         log.append(i)
                     
@@ -659,9 +678,9 @@ def handle_msg(data, port):
             sendAppendMessage(sender, port)
             #ask them again with a smaller nextIndex
     elif(data == "PrintDatastore"):
-        print("Datastore:\n")
+        debug_print("Datastore:\n")
         for i in range(0, commitIndex):
-            print(log[i])
+            debug_print(log[i])
     elif(data[:12] == "PrintBalance"):
         entryID = int(data.split()[1])
         debug_print(f"Printbalance entryid {balance[entryID]}")
@@ -734,14 +753,14 @@ def get_user_input():
                 serverSocket.close()
                 _exit(0)
             elif userInput == "locks":
-                print(locks)
-                print(lastApplied)
-                print(commitIndex)
+                debug_print(locks)
+                debug_print(lastApplied)
+                debug_print(commitIndex)
             elif userInput == "logs":
                 for i in log:
-                    print(i)
+                    debug_print(i)
             elif userInput == "balance":
-                print(balance)
+                debug_print(balance)
             elif(userInput == "makeleader"):
                 threading.Thread(target=startElection).start()
         except EOFError or AttributeError or IndexError:
@@ -776,7 +795,7 @@ def sendHeartbeat():
                     prevLog = log[len(log)-2]
                 else:
                     prevLog = logEntry(0,0)
-                # print(f"Heartbeat {commitIndex}...")
+                # debug_print(f"Heartbeat {commitIndex}...")
                 serverSocket.sendto(f"AppendEntries {currentTerm} {MYID} {prevLog.index} {prevLog.term} {commitIndex}...".encode(), ('127.0.0.1', port))
 
 def heartbeat():#when become leader call heartbeat
@@ -790,16 +809,16 @@ def connect():
     users = [8999, 9000, 9001+ (SHARDID*3),9002+ (SHARDID*3),9003+ (SHARDID*3)]
     for i in users:
         if i != SERVER_PORT:
-            print("connecting to ", i)
+            debug_print("connecting to ", i)
             serverSocket.sendto(f"Hi {sys.argv[1]}".encode(), ('127.0.0.1', i))
 
 def debug_print(*args, **kwargs):
     """
     Print only if DEBUG is True.
-    Accepts any arguments that a normal print function would.
+    Accepts any arguments that a normal debug_print function would.
     """
     if DEBUG:
-        print(*args, **kwargs)
+        debug_print(*args, **kwargs)
 
 #inits
 if __name__ == "__main__":
@@ -840,9 +859,9 @@ if __name__ == "__main__":
             if f.read() != '':
                 f.seek(0)
                 lastApplied = int(f.readline())
-                print(lastApplied)
+                debug_print(lastApplied)
                 commitIndex = int(f.readline())
-                print(commitIndex)
+                debug_print(commitIndex)
     except FileNotFoundError:
         with open(f'./saves/lastApp{MYID}.txt', 'x') as f:
             ...
