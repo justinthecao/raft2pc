@@ -49,7 +49,6 @@ class logEntry():
         )
 
     def __str__(self):
-        print(self.t)
         if self.t == LETypes.CROSSDECISION.value:
             if self.transaction[1] == 1:
                 blockType = "CommitCross"
@@ -69,7 +68,6 @@ class logEntry():
             return (
                 "(\n"
                 + f"\tType: {blockType}\n"
-                + f"\tID: {self.requestID}\n"
                 + f"\tIndex: {self.index}\n"
                 + f"\tTerm: {self.term}\n"
                 + f"\tSender: {self.transaction[0]}\n"
@@ -82,7 +80,6 @@ class logEntry():
             return (
                 "(\n"
                 + f"\tType: {blockType}\n"
-                + f"\tID: {self.requestID}\n"
                 + f"\tIndex: {self.index}\n"
                 + f"\tTerm: {self.term}\n"
                 + f"\tSender: {self.transaction[0]}\n"
@@ -91,5 +88,6 @@ class logEntry():
                 + ")\n"
             )
         elif self.t == LETypes.GHOST.value:
-            return "(GHOST)"
+            return "..."
+        
        

@@ -44,7 +44,7 @@ matchIndex = None
 #used for electionTimeout
 electionTimeout = 0 #static
 timer = None
-sendDelay = 0
+sendDelay = 3
 
 #memory balance
 balance = {}
@@ -76,10 +76,14 @@ saveDatabaseSem = threading.Semaphore(0)
 conductTranLock = threading.Lock()
 updatelocks = threading.Lock()
 
+partition = False
+
+tryUnblock = False
+
 
 #conducts a transaction and adds it to the blockchain also updates the balances
 def commitTransaction(sender, receiver, amount):
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     balance[sender] -= amount
     balance[receiver] += amount
     debug_print(f"balance of {sender} is {balance[sender]}")
@@ -87,7 +91,7 @@ def commitTransaction(sender, receiver, amount):
     saveDatabaseSem.release()
 
 def commitCross(entry, amount):
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     balance[entry] += amount
     saveDatabaseSem.release()
 
@@ -97,9 +101,10 @@ def checkLock(ID):
             return locks[ID] > 0
 #adds a lock to an entry
 def addLock(ID, send, myLock=False):
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
-    debug_print("locking: ",ID)
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
+    debug_print(f"locking {myLock}: ",ID)
     with updatelocks:
+        ID = int(ID)
         if ID not in locks:
             locks[ID] = 1
         else:
@@ -110,16 +115,21 @@ def addLock(ID, send, myLock=False):
         if send:
             for i in users:
                 if i != SERVER_PORT and i != 9000 and i != 8999:
-                    serverSocket.sendto(f"Lock {ID}".encode(), ('127.0.0.1', i))
+                    if not partition:
+                        serverSocket.sendto(f"Lock {ID}".encode(), ('127.0.0.1', i))
 
 #releases a lock to an entry
 def releaseLock(ID, send, myLock=False):
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     with updatelocks:
-        debug_print("unlocking: ",ID)
+        debug_print(f"unlocking {myLock}: ",ID)
         ID = int(ID)
+        if myLock:
+            if ID not in mylocks:
+                return
         if ID in locks:
             locks[ID] = max(0, locks[ID]-1)
+            debug_print(f"locks[{ID}], ", locks[ID])
         if myLock:
             if ID in mylocks:
                 mylocks.remove(ID)
@@ -127,13 +137,15 @@ def releaseLock(ID, send, myLock=False):
         if send:
             for i in users:
                 if i != SERVER_PORT and i != 9000 and i != 8999:
-                    serverSocket.sendto(f"Unlock {ID}".encode(), ('127.0.0.1', i))
+                    if not partition:
+                        serverSocket.sendto(f"Unlock {ID}".encode(), ('127.0.0.1', i))
     
 def everyoneLock(ID):
     addLock(ID, False, True)
     for i in users:
         if i != SERVER_PORT and i != 9000 and i != 8999:
-            serverSocket.sendto(f"EveryoneLock {ID}".encode(), ('127.0.0.1', i))
+            if not partition:
+                serverSocket.sendto(f"EveryoneLock {ID}".encode(), ('127.0.0.1', i))
 
 def everyoneUnlock(ID):
     releaseLock(ID, False, True)
@@ -142,7 +154,7 @@ def everyoneUnlock(ID):
             serverSocket.sendto(f"EveryoneUnlock {ID}".encode(), ('127.0.0.1', i))
 
 def saveLocks():
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     try:
         with open(f'./saves/locks{MYID}.txt', 'x') as f:
             dump = json.dumps(list(mylocks))
@@ -155,7 +167,7 @@ def saveLocks():
 
 
 def saveLog():
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     while(True):
         saveDatabaseSem.acquire()
         debug_print("saving")
@@ -166,6 +178,8 @@ def saveLog():
             f.write(str(lastApplied))
             f.write("\n")
             f.write(str(commitIndex))
+            f.write("\n")
+            f.write(str(currentTerm))
         with open(f'./saves/database{MYID}.txt', 'w') as f:
             dump = json.dumps(balance)
             f.write(dump)
@@ -173,7 +187,7 @@ def saveLog():
 
 #starts an election because I want to be a leader :)))        
 def startElection():
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     if(state == 2):
         return
     #start electionTimer
@@ -187,7 +201,8 @@ def startElection():
         if i != SERVER_PORT and i != 9000 and i != 8999:
             lastLog = log[len(log)-1] if len(log)>0 else logEntry(0,0)
             debug_print(f"Sending RequestVote to {i}")
-            serverSocket.sendto(f"RequestVote {MYID} {currentTerm} {lastLog.index} {lastLog.term}".encode(), ('127.0.0.1', i))
+            if not partition:
+                serverSocket.sendto(f"RequestVote {MYID} {currentTerm} {lastLog.index} {lastLog.term}".encode(), ('127.0.0.1', i))
 
     #wait until currentTerm is the same
     saveCurrentTerm = currentTerm
@@ -197,7 +212,7 @@ def startElection():
         if(votes >= 2):
             currentLeader = MYID
             state = 2
-            debug_print("I am the leader")
+            print("Won leader election!")
             #contains the next log index to send to each server
             #this is not an actual index
             nextIndex = {1 + (SHARDID*3): len(log)+1, 2 + (SHARDID*3): len(log)+1, 3 + (SHARDID*3): len(log)+1}
@@ -214,7 +229,7 @@ def startElection():
 
 
 def applyLog(applyIndex):
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     #if its a cross shard transaction skip
     #if its a intra apply
     #if its a cross commit apply the cross
@@ -240,7 +255,7 @@ def applyLog(applyIndex):
     saveDatabaseSem.release()
                     
 def updateCommitIdx():
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     while(state == 2):
         with databaselock:
         # If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
@@ -263,7 +278,7 @@ def updateCommitIdx():
 
 
 def sendAppendMessage(id, port):
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     start = nextIndex[id]
     debug_print("Start ", start)
     #nexxtIndex is the next block idx to send starts from 1
@@ -274,11 +289,13 @@ def sendAppendMessage(id, port):
     json_data = json.dumps([entry.to_dict() for entry in entries])
     sendMess = f"AppendEntries {currentTerm} {MYID} {prevLog.index} {prevLog.term} {commitIndex}...{json_data}"
     debug_print(sendMess)
-    serverSocket.sendto(sendMess.encode(), ('127.0.0.1', port))
+    if not partition:
+        debug_print("partition is false")
+        serverSocket.sendto(sendMess.encode(), ('127.0.0.1', port))
 
 
 def sendGhostAppend():
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     
     entry = logEntry(len(log)+1, currentTerm, (-1, -1, -1), LETypes.GHOST.value)
     #append command to log
@@ -296,7 +313,7 @@ def sendGhostAppend():
                 sendAppendMessage(id, port)
 
 def conductIntra(data, clientPort):
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
 
     data = data.decode()
     split = data.split()
@@ -305,6 +322,8 @@ def conductIntra(data, clientPort):
     amt = int(split[3])
     requestID = int(split[4])
     if(len(split) > 5):
+        if(state == 2):
+            return
         clientPort = int(split[5])
     if (sender == -1):
         sendGhostAppend()
@@ -319,7 +338,7 @@ def conductIntra(data, clientPort):
             debug_print(f"{sender} {receiver} {amt} {requestID} already in log")
             debug_print("Already in log")
             return
-    if(checkLock(sender) or checkLock(receiver)):
+    if(state == 2 and (checkLock(sender) or checkLock(receiver))):
         serverSocket.sendto(f"IntraResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
         return  
     if(state != 2):
@@ -330,12 +349,15 @@ def conductIntra(data, clientPort):
             serverSocket.sendto(f"IntraRequest {sender} {receiver} {amt} {requestID} {clientPort}".encode(), ('127.0.0.1', 9000 + currentLeader))
         return
 
-    with conductTranLock:
+    conductTranLock.acquire()
+    try:
+        releasedTranLock = False
         for i in log:
             if i.requestID == requestID:
                 debug_print(f"{sender} {receiver} {amt} {requestID} already in log")
                 return
-        
+        if state != 2:
+            return
         debug_print('got passed log check')
         
         #server is a leader
@@ -366,18 +388,30 @@ def conductIntra(data, clientPort):
                 #if last index >= nextindex
                 if(nextIndex[id] <= len(log)):
                     sendAppendMessage(id, port)
-    #wait until you have committed the index
-    while(commitIndex < entry.index):
-        continue
-    #tell user
-    reply = f"IntraResponse Yes {requestID} {MYID}"
-    debug_print(f"replying to client {clientPort} ", reply)
-    serverSocket.sendto(f"IntraResponse Yes {requestID} {MYID}".encode(), ('127.0.0.1', clientPort))
+        #wait until you have committed the index
+        while(commitIndex < entry.index):
+            if tryUnblock and not releasedTranLock:
+                tryUnblock = False
+                releasedTranLock = True
+                conductTranLock.release()
+            continue
 
+        if(log[entry.index-1].term != currentTerm):
+            serverSocket.sendto(f"IntraResponse No {requestID} {MYID} 2".encode(), ('127.0.0.1', clientPort))
+            releaseLock(sender, False, True)
+            releaseLock(receiver, False, True)
+            return
+        #tell user
+        reply = f"IntraResponse Yes {requestID} {MYID}"
+        debug_print(f"replying to client {clientPort} ", reply)
+        serverSocket.sendto(f"IntraResponse Yes {requestID} {MYID}".encode(), ('127.0.0.1', clientPort))
+    finally:
+        if conductTranLock.locked() and not releasedTranLock:
+            conductTranLock.release()
     
 
 def conductCross(data, clientPort):
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     data = data.decode()
     split = data.split()
     sender = int(split[1])
@@ -385,6 +419,8 @@ def conductCross(data, clientPort):
     amount = int(split[3])
     requestID = int(split[4])
     if(len(split) > 5):
+        if(state == 2):
+            return
         clientPort = int(split[5])
 
     # if(state == 2):
@@ -405,20 +441,24 @@ def conductCross(data, clientPort):
     
     isSenderShard = (int(sender)-1)//1000 == SHARDID
     #RAFT consists of getting locks and getting consensus
-    if isSenderShard and checkLock(sender):
+    if state == 2:
+        if isSenderShard and checkLock(sender):
+                serverSocket.sendto(f"CrossResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
+                return
+        if not isSenderShard and checkLock(receiver):
             serverSocket.sendto(f"CrossResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
             return
-    if not isSenderShard and checkLock(receiver):
-        serverSocket.sendto(f"CrossResponse No {requestID} {MYID} 0".encode(), ('127.0.0.1', clientPort))
-        return
     
     if(state != 2):
         pendingEntries.append((data, clientPort))
         if(currentLeader != None):
             serverSocket.sendto(f"CrossRequest {sender} {receiver} {amount} {requestID} {clientPort}".encode(), ('127.0.0.1', 9000 + currentLeader))
         return
-   
-    with conductTranLock:
+    conductTranLock.acquire()
+    try:
+        releasedTranLock = False
+        if state != 2:
+            return
         #check the logs again
         for i in log:
             if i.requestID == requestID:
@@ -463,16 +503,33 @@ def conductCross(data, clientPort):
 
         #if got consensus, reply to client
 
-    while(commitIndex < entry.index):
-        continue
-    #wait for client to reply commit block
-    reply = f"CrossResponse Yes {requestID} {MYID}"
+        while(commitIndex < entry.index):
+            if tryUnblock and not releasedTranLock:
+                tryUnblock = False
+                releasedTranLock = True
+                conductTranLock.release()
+                #release the tran lock
+            continue
 
-    debug_print(f"replying to client {clientPort} ", reply)
-    serverSocket.sendto(reply.encode(), ('127.0.0.1', clientPort))
-    #should tell me what block to commit?
-    #release locks
+        if(log[entry.index-1].term != currentTerm):
+            if(isSenderShard):
+                releaseLock(sender, False, True)
+            else:
+                releaseLock(receiver, False, True)
+            print("Could not get consensus")
+            serverSocket.sendto(f"CrossResponse No {requestID} {MYID} 2".encode(), ('127.0.0.1', clientPort))
+            
+            return
+        #wait for client to reply commit block
+        reply = f"CrossResponse Yes {requestID} {MYID}"
 
+        debug_print(f"replying to client {clientPort} ", reply)
+        serverSocket.sendto(reply.encode(), ('127.0.0.1', clientPort))
+        #should tell me what block to commit?
+        #release locks
+    finally:
+        if conductTranLock.locked() and not releasedTranLock:
+            conductTranLock.release()
 
 
 
@@ -482,7 +539,7 @@ def conductCross(data, clientPort):
 
 #given an index to revert back to, check lastApplied 
 def fixLog(prevIdx):
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     debug_print("fixing log", prevIdx)
     with databaselock:
             if(lastApplied <= prevIdx):
@@ -529,22 +586,44 @@ def fixLog(prevIdx):
 
 
 def handle_msg(data, port):
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     # simulate 3 seconds message-passing delay
     # decode byte data into a string
     data = data.decode()
+
+    if(data=="locks"):
+        print(locks)
+        print(lastApplied)
+        print(commitIndex)
+    if data == "exit":
+                serverSocket.close()
+                _exit(0)
+    if(data == "PrintDatastore"):
+        print("Datastore:\n")
+        for i in range(0, commitIndex):
+            print(log[i])
+    if(data[:12] == "PrintBalance"):
+        entryID = int(data.split()[1])
+        debug_print(f"Printbalance entryid {balance[entryID]}")
+        serverSocket.sendto(f"PrintBalance {balance[entryID]}".encode(), ('127.0.0.1', port))
+    
+    if partition:
+        return
+
     # debug_print(data)
     # echo message to console
     if(data[:2] == "Hi"):
         if(port not in users.keys()):
             users[port] = int(data[3:])
             debug_print("connected to", users[port])
+        tryUnblock = True
         serverSocket.sendto(f"Done {sys.argv[1]}".encode(), ('127.0.0.1', port))
     
     if(data[:4] == "Done"):
         if(port not in users.keys()):
             users[port] = int(data[5:])
             debug_print("connected to", users[port])
+
     if(port not in users.keys()):
         return
     sender = int(users[port])
@@ -588,7 +667,6 @@ def handle_msg(data, port):
         debug_print(data)
         threading.Thread(target=conductCross, args=(data.encode(),port,)).start()
     elif(data[:13] == "AppendEntries"):
-        # debug_print(f"   | Message received from {sender}: {data}")
         split = data.split("...")
         
         values = split[0]
@@ -600,14 +678,18 @@ def handle_msg(data, port):
         reqPrevTerm =   int(valuesplit[4])
         reqComIdx = int(valuesplit[5])
         #if term is greater than currentTerm, become follower
-        if(reqTerm >= currentTerm):
+        if(reqTerm > currentTerm):
+            debug_print(f"   | Message received from {sender}: {data}")
+            debug_print("reqTerm/CurrTerm", reqTerm, currentTerm)
             state = 0
             currentTerm = reqTerm
             currentLeader = reqID
             timer = electionTimeout
+            debug_print("becoming follower")
         #its a heartbeat
         if(entries == ''):
             pendingEntries  = []
+            timer = electionTimeout
             # debug_print("Entries is empty") its an heartbeat
             serverSocket.sendto(f"AppendResponse {currentTerm} No -1".encode(), ('127.0.0.1', port))
         else:
@@ -677,18 +759,13 @@ def handle_msg(data, port):
             nextIndex[sender] = nextLog
             sendAppendMessage(sender, port)
             #ask them again with a smaller nextIndex
-    elif(data == "PrintDatastore"):
-        debug_print("Datastore:\n")
-        for i in range(0, commitIndex):
-            debug_print(log[i])
-    elif(data[:12] == "PrintBalance"):
-        entryID = int(data.split()[1])
-        debug_print(f"Printbalance entryid {balance[entryID]}")
-        serverSocket.sendto(f"PrintBalance {balance[entryID]}".encode(), ('127.0.0.1', port))
+    
     elif(data[:13] == "CrossDecision"):
         split = data.split()
         answer = split[1]
         requestID = int(split[2])
+        senderID = int(split[3])
+        receiverID = int(split[4])
         logIndex = None
         crossLog = None
         for i in log:
@@ -714,12 +791,12 @@ def handle_msg(data, port):
             #lets try to commit a rando block
             threading.Thread(target=conductIntra, args=("0 -1 -1 -1 -1".encode(),port,)).start()
             
-        if crossLog != None:
-            isSender = (crossLog.transaction[0]-1)//1000 == SHARDID
-            if isSender:
-                releaseLock(crossLog.transaction[0], True, True)
-            else:
-                releaseLock(crossLog.transaction[1], True, True)
+
+        isSender = (senderID-1)//1000 == SHARDID
+        if isSender:
+            releaseLock(senderID, True, True)
+        else:
+            releaseLock(receiverID, True, True)
         
     elif(data[:4] == "Lock"):
         ID = int(data.split()[1])
@@ -730,21 +807,20 @@ def handle_msg(data, port):
     elif(data[:12] == "EveryoneLock"):
         ID = int(data.split()[1])
         #achnowledge the incoming lock
-        addLock(ID, False, True)
+        addLock(ID, False, False)
         #tell everyone that you have the lock as well
-        addLock(ID, True, False)
+        addLock(ID, True, True)
     elif(data[:14] == "EveryoneUnlock"):
         ID = int(data.split()[1])
         #acknowledge the incoming unlock
-        releaseLock(ID, False, True)
+        releaseLock(ID, False, False)
         #tell everyone that you released the lock
-        releaseLock(ID, True, False)
-    elif data == "exit":
-                serverSocket.close()
-                _exit(0)
+        releaseLock(ID, True, True)
+   
 
 
 def get_user_input():
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     while True:
         try:
             userInput = input()
@@ -753,22 +829,39 @@ def get_user_input():
                 serverSocket.close()
                 _exit(0)
             elif userInput == "locks":
-                debug_print(locks)
-                debug_print(lastApplied)
-                debug_print(commitIndex)
+                print(locks)
+                print(lastApplied)
+                print(commitIndex)
             elif userInput == "logs":
                 for i in log:
-                    debug_print(i)
+                    print(i)
             elif userInput == "balance":
-                debug_print(balance)
+                print(balance)
             elif(userInput == "makeleader"):
                 threading.Thread(target=startElection).start()
+            elif(userInput == "partition"):
+                print("Partitioned!")
+                partition = True
+            elif(userInput == "unpartition"):
+
+                users = {8999:-1, 9000:0, 9001+ (SHARDID*3):1 +(SHARDID*3),9002+ (SHARDID*3): 2 +(SHARDID*3),9003+ (SHARDID*3): 3+(SHARDID*3)}
+                for i in users:
+                    if i != SERVER_PORT:
+                        debug_print("connecting to ", i)
+                        serverSocket.sendto(f"Hi {sys.argv[1]}".encode(), ('127.0.0.1', i))
+                print("Unpartitioned!")
+                timer = electionTimeout
+                partition = False
+            elif(userInput == "debug"):
+                DEBUG = not DEBUG
+            
+            
         except EOFError or AttributeError or IndexError:
             continue
 
 #starts elections if haven't heard in a bit
 def handleElectionTimeout():
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     while(1):
         if (timer > 0 or state == 2): continue
         #if haven't received a rpc yet (leader has crashed) and isn't in the middle of an election start an election
@@ -779,14 +872,14 @@ def handleElectionTimeout():
 
 
 def subtractTimer():
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
     while(1):
         sleep(.03)
         timer -= .03
 
 
 def sendHeartbeat():
-    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs
+    global currentTerm, currentLeader,  state, votedFor, votes, log, commitIndex, lastApplied, nextIndex, matchIndex, timer, balance, users, entryKeys, databaseUpdate, locks, mylocks, pendingEntries, pendingReqs, partition, tryUnblock, DEBUG
 
     for port in users:
             if port != SERVER_PORT and port != 9000 and port != 8999:
@@ -795,18 +888,19 @@ def sendHeartbeat():
                     prevLog = log[len(log)-2]
                 else:
                     prevLog = logEntry(0,0)
-                # debug_print(f"Heartbeat {commitIndex}...")
-                serverSocket.sendto(f"AppendEntries {currentTerm} {MYID} {prevLog.index} {prevLog.term} {commitIndex}...".encode(), ('127.0.0.1', port))
+                if not partition:
+                    serverSocket.sendto(f"AppendEntries {currentTerm} {MYID} {prevLog.index} {prevLog.term} {commitIndex}...".encode(), ('127.0.0.1', port))
 
 def heartbeat():#when become leader call heartbeat
     while(state == 2):
-            sleep(1)
+            sleep(.2)
             threading.Thread(target=sendHeartbeat).start()
 
 #initializes connections betweens servers
 def connect():
+    global users, DEBUG
     #client is 9000
-    users = [8999, 9000, 9001+ (SHARDID*3),9002+ (SHARDID*3),9003+ (SHARDID*3)]
+    users = {8999:-1, 9000:0, 9001+ (SHARDID*3):1 +(SHARDID*3),9002+ (SHARDID*3): 2 +(SHARDID*3),9003+ (SHARDID*3): 3+(SHARDID*3)}
     for i in users:
         if i != SERVER_PORT:
             debug_print("connecting to ", i)
@@ -818,7 +912,7 @@ def debug_print(*args, **kwargs):
     Accepts any arguments that a normal debug_print function would.
     """
     if DEBUG:
-        debug_print(*args, **kwargs)
+        print(*args, **kwargs)
 
 #inits
 if __name__ == "__main__":
@@ -827,6 +921,7 @@ if __name__ == "__main__":
     SERVER_PORT = int(sys.argv[2])
     SHARDID = (MYID-1)//3
     debug_print(SERVER_PORT)
+    print("Starting...")
     parser = argparse.ArgumentParser(description="Run server")
     parser.add_argument("--debug", action="store_true", help="Turn on debugger statements")
     args, unknown = parser.parse_known_args()
@@ -862,6 +957,8 @@ if __name__ == "__main__":
                 debug_print(lastApplied)
                 commitIndex = int(f.readline())
                 debug_print(commitIndex)
+                currentTerm = int(f.readline())
+                debug_print(currentTerm)
     except FileNotFoundError:
         with open(f'./saves/lastApp{MYID}.txt', 'x') as f:
             ...
@@ -880,8 +977,9 @@ if __name__ == "__main__":
     # threading.Thread(target=initialize).start()
     serverSocket = socket(AF_INET, SOCK_DGRAM)
     serverSocket.bind(('', SERVER_PORT))
-    electionTimeout = random.random()*10 + sendDelay
+    electionTimeout = (MYID % 3) * 2 + 2
     timer = electionTimeout
+    debug_print("Election Timeout: ", electionTimeout)
     debug_print("Server is up and running")
     serverSocket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
     threading.Thread(target=connect).start()

@@ -23,8 +23,8 @@ ids = set()
 DEBUG = False
 random = [0,0,0]
 
-crossTransactionTimeout = 100
-intraTransactionTimeout = 100
+crossTransactionTimeout = 10
+intraTransactionTimeout = 10
 
 
 
@@ -49,16 +49,22 @@ class crossHandler:
     id = None
     gotAbort = False
     decisionSent = False
+    decision = None
     responses = 0
     sender = None
     receiver = None
     amount = None
+    error1 = None
+    error2 = None
+    timedOut = False
 
     def __init__(self, id, sender, receiver, amount):
         self.id = id
         self.sender = sender
         self.receiver = receiver
         self.amount = amount
+    def __str__(self):
+        return f"ID: {self.id}, Sender: {self.sender}, Receiver: {self.receiver}, Amount: {self.amount}, GotAbort: {self.gotAbort}, DecisionSent: {self.decisionSent}, Decision: {self.decision}, Responses: {self.responses}, Error1: {self.error1}, Error2: {self.error2}"
 
 class intraHandler:
     id = None
@@ -67,12 +73,17 @@ class intraHandler:
     timedOut = False
     amount = None
     gotDecision = False
+    decision = None
+    error = None
 
     def __init__(self, id, sender, receiver, amount):
         self.id = id
         self.sender = sender
         self.receiver = receiver
         self.amount = amount
+
+    def __str__(self):
+        return f"ID: {self.id}, Sender: {self.sender}, Receiver: {self.receiver}, Amount: {self.amount}, TimedOut: {self.timedOut}, GotDecision: {self.gotDecision}, Decision: {self.decision}, Error: {self.error}"
 
 class fileTransactionData:
     count = None
@@ -97,6 +108,7 @@ def timer(requestID):
     sleep(crossTransactionTimeout)
     if not crossHandlers[requestID].decisionSent:
         crossHandlers[requestID].gotAbort = True
+        crossHandlers[requestID].timedOut = True
         sendCommitAbort(requestID)
 
 def intraTimer(requestID):
@@ -106,7 +118,8 @@ def intraTimer(requestID):
         if requestID in fileTransHandlers:
             debug_print("releasing")
             fileTransHandlers[requestID].sem.release()
-        print("Intra Request Timed Out,", intraHandlers[requestID].receiver, intraHandlers[requestID].sender, intraHandlers[requestID].amount)
+        handle = intraHandlers[requestID]
+        print(f"Intra Request Timed Out, t({handle.sender}, {handle.receiver}, {handle.amount})")
 
 
 #send request to all other servers
@@ -142,7 +155,7 @@ def sendReq(sender, receiver, amount, fileTransfer = None):
         #TODO: sendt o everyone
         shard1 = (sender-1)//1000
         shard2 = (receiver-1)//1000
-        print(f"Shard1: {shard1}, Shard2: {shard2}")
+        # print(f"Shard1: {shard1}, Shard2: {shard2}")
         requestID = int(getID())
         # if(leaders[shard1] == None):
         #     print("Leader1 not found")
@@ -179,20 +192,25 @@ def sendCommitAbort(requestID):
         return
     sender = crossHandlers[requestID].sender
     receiver = crossHandlers[requestID].receiver
-
+    crossHandlers[requestID].decisionSent = True
     if crossHandlers[requestID].gotAbort:
+        crossHandlers[requestID].decision = "No"
+
         if requestID in fileTransHandlers:
             debug_print("releasing")
             fileTransHandlers[requestID].sem.release()
-        message = f"CrossDecision No {requestID}"
-        
-        print("Cross Request Denied,", crossHandlers[requestID].sender, crossHandlers[requestID].receiver, crossHandlers[requestID].amount)
+        message = f"CrossDecision No {requestID} {sender} {receiver}"
+        handler = crossHandlers[requestID]
+        print(f"Cross Request Denied, t({handler.sender}, {handler.receiver}, {handler.amount}) | Error1: {handler.error1} | Error2: {handler.error2} | TimedOut: {handler.timedOut}\n")
     else:
+        crossHandlers[requestID].decision = "Yes"
+
         if requestID in fileTransHandlers:
             debug_print("releasing")
             fileTransHandlers[requestID].sem.release()
-        message = f"CrossDecision Yes {requestID}"
-        print("Cross Request Approved,", crossHandlers[requestID].sender, crossHandlers[requestID].receiver, crossHandlers[requestID].amount)
+        message = f"CrossDecision Yes {requestID} {sender} {receiver}"
+        handler = crossHandlers[requestID]
+        print(f"Cross Request Approved, t({handler.sender}, {handler.receiver}, {handler.amount})\n")
     
     #send to all servers decision
     shard1 = (sender-1)//1000
@@ -201,23 +219,29 @@ def sendCommitAbort(requestID):
         serverSocket.sendto(message.encode(), ('127.0.0.1', i))
     for i in range(9001 + 3*(shard2), 9004 + 3*(shard2)):
         serverSocket.sendto(message.encode(), ('127.0.0.1', i))
-    crossHandlers[requestID].decisionSent = True
     
 
 def timeFileTransaction(fileTransactionData):
-    print("starting to time")
+    debug_print("starting to time")
     currtime = time.time_ns()
     replies = 0
-    print("filecount", fileTransactionData.count)
+    debug_print("filecount", fileTransactionData.count)
     while(replies < fileTransactionData.count):
-        print("waiting")
+        debug_print("waiting")
         fileTransactionData.sem.acquire()
-        print("acquired")
+        debug_print("acquired")
         replies += 1
-        print("reply", replies)
-        print("filecount", fileTransactionData.count)
+        debug_print("reply", replies)
+        debug_print("filecount", fileTransactionData.count)
 
-    print("HIIII" , (time.time_ns() - currtime)/1e9)
+    print("Transaction time: " , (time.time_ns() - currtime)/1e9)
+    print("\tDetails:")
+    for i in fileTransactionData.transactions:
+        if i in intraHandlers:
+            print("\tIntra: ", intraHandlers[i])
+        if i in crossHandlers:
+            print("\tCross: ", crossHandlers[i])
+
 
     
 def get_user_input():
@@ -228,6 +252,9 @@ def get_user_input():
             # close all sockets before exiting
             if userInput[:8] == "Transfer":
                 split = userInput.split()
+                if len(split) != 4:
+                    print("Invalid input")
+                    continue
                 sender = int(split[1])
                 receiver = int(split[2])
                 amount = int(split[3])
@@ -239,7 +266,7 @@ def get_user_input():
             
             elif userInput[:12] == "FileTransfer":
                 filename = userInput.split()[1]
-                print(filename)
+                debug_print(filename)
                 try:
                     
                     with open(filename) as f:
@@ -253,13 +280,13 @@ def get_user_input():
                             sender = int(split[0][1:])
                             receiver = int(split[1])
                             amount = int(split[2].split(')')[0])
-                            print("amount", amount)
+                            # print("amount", amount)
                             if(sender < 1 or sender > 3000 or receiver < 1 or receiver > 3000):
                                 print("Invalid sender or receiver")
                                 continue
                             fileData.count += 1
                             threading.Thread(target=sendReq, args=(sender, receiver, amount, fileData)).start()
-                        print("COUNT: ", fileData.count)
+                        debug_print("COUNT: ", fileData.count)
                         debug_print("after releasing")
                         fileData.sem.release()
 
@@ -273,12 +300,21 @@ def get_user_input():
             elif userInput[:12] == "PrintBalance":
                 entryID = int(userInput.split()[1])
                 for i  in range(9001 + 3*((entryID-1)//1000), 9004 + 3*((entryID-1)//1000)):
-                    print("Sending to", i)
+                    # print("Sending to", i)
                     serverSocket.sendto(f"PrintBalance {entryID}".encode(), ('127.0.0.1', i))
-
+            elif userInput == "Leaders":
+                print(leaders)
+                print("\n")
             elif userInput == "exit":
                 serverSocket.close()
                 _exit(0)
+            elif userInput == "closeAll":
+                for i in users:
+                    serverSocket.sendto(f"exit".encode(), ('127.0.0.1', i))
+            elif userInput == "":
+                continue
+            else:
+                print("Invalid input")
         except Exception as e:
             print(e)
             continue
@@ -294,12 +330,12 @@ def handle_msg(data, port):
     if(data[:2] == "Hi"):
         users[port] = int(data[3:])
         serverSocket.sendto(f"Done {MYID}".encode(), ('127.0.0.1', port))
-        print("connected to", users[port])
+        debug_print("connected to", users[port])
     
     if(data[:4] == "Done"):
         if(port not in users.keys()):
             users[port] = int(data[5:])
-            print("connected to", users[port])
+            debug_print("connected to", users[port])
 
     serverID = int(users[port])
 
@@ -311,34 +347,52 @@ def handle_msg(data, port):
 
         answer = data[1]
         requestID = int(data[2])
-    
+        if intraHandlers[requestID].gotDecision:
+            return
+        if len(data) > 4:
+            error = int(data[4])
+            if error != 2 and int(data[3]) != leaders[(serverID-1)//3]:
+                debug_print("error from old server")
+                return
+
         if len(data) > 3:
             leader = int(data[3])
             shard = (serverID - 1)//3
             leaders[shard] = leader
-        if intraHandlers[requestID].gotDecision:
-            return
+        
+        
         if answer == "Yes":
             if intraHandlers[requestID].timedOut:
-                print("Intra Request Updated to Committed,", intraHandlers[requestID].sender, intraHandlers[requestID].receiver, intraHandlers[requestID].amount)
+                handler = intraHandlers[requestID]
+                handler.gotDecision = True
+                print(f"Intra Request Updated to Committed, t({handler.sender}, {handler.receiver}, {handler.amount})\n")
             else:
                 if requestID in fileTransHandlers:
                     debug_print("releasing")
                     fileTransHandlers[requestID].sem.release()
                 intraHandlers[requestID].gotDecision = True
-                print("Intra Request Approved, Transaction Details: ", intraHandlers[requestID].sender, intraHandlers[requestID].receiver, intraHandlers[requestID].amount)
+                intraHandlers[requestID].decision = "Yes"
+                handler = intraHandlers[requestID]
+                print(f"Intra Request Approved, t({handler.sender}, {handler.receiver}, {handler.amount})\n")
+        
         if(answer == "No"):
             error = int(data[4])
             errmsg = ""
             if error == 1:
                 errmsg = "Insufficient funds"
             if error == 0:
+
                 errmsg = "Ongoing transaction with either sender or receiver"
+            if error == 2:
+                errmsg = "Unability to get consensus"
             if requestID in fileTransHandlers:
                 debug_print("releasing")
                 fileTransHandlers[requestID].sem.release()
             intraHandlers[requestID].gotDecision = True
-            print(f"Intra Request Denied | {errmsg} |, Transaction Details: ", intraHandlers[requestID].sender, intraHandlers[requestID].receiver, intraHandlers[requestID].amount)
+            intraHandlers[requestID].decision = "No"
+            intraHandlers[requestID].error = errmsg
+            handler = intraHandlers[requestID]
+            print(f"Intra Request Denied | {errmsg} |, t({handler.sender}, {handler.receiver}, {handler.amount})\n")
         
 
     if(data[:13] == "CrossResponse"):
@@ -354,11 +408,19 @@ def handle_msg(data, port):
         debug_print(crossHandlers[requestID].sender, crossHandlers[requestID].receiver, crossHandlers[requestID].amount)
         if(answer == "No"):
             error = int(data[4])
+            errmsg = ""
             if error == 1:
-                debug_print("CrossRequestVotedNO due to Insufficient funds")
+                errmsg = "Insufficient funds"
             if error == 0:
-                debug_print("CrossRequestVotedNO due to Ongoing transaction with either sender or receiver")
+                errmsg = "Ongoing transaction with either sender or receiver"
+            if error == 2:
+                errmsg = "Unability to get consensus"
+            debug_print("error ", error)
             crossHandlers[requestID].gotAbort = True
+            if(crossHandlers[requestID].error1 == None):
+                crossHandlers[requestID].error1 = errmsg
+            else:
+                crossHandlers[requestID].error2 = errmsg
         if crossHandlers[requestID].responses == 2:
             sendCommitAbort(requestID)
         
@@ -376,12 +438,13 @@ def handle_msg(data, port):
     
     if(data[:12] == "PrintBalance"):
         print(f"Balance from {serverID}: ", data.split()[1])
-
+    
+    
 def connect():
     users = [9001,9002,9003,9004,9005,9006,9007,9008,9009]
     for i in users:
         if i != SERVER_PORT:
-            print("connecting to", i)
+            # print("connecting to", i)
             serverSocket.sendto(f"Hi {MYID}".encode(), ('127.0.0.1', i))
 
 def threadOffInputs():
