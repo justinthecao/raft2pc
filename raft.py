@@ -6,7 +6,7 @@
 import socket
 import threading
 
-from socket import *
+from socket import AF_INET, SOCK_DGRAM
 from os import _exit
 from sys import stdout
 from time import sleep
